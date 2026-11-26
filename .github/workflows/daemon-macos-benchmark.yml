@@ -1,0 +1,106 @@
+name: Daemon macOS coverage benchmark
+
+on:
+  push:
+    branches: [experiment/daemon-macos-coverage]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    if: github.repository == 'sn1thy/openrig' && github.ref == 'refs/heads/experiment/daemon-macos-coverage'
+    runs-on: macos-latest
+    timeout-minutes: 185
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: c99908ee7c645c4da4578e46d6d879da830d13aa
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: brew install tmux
+      - run: npm ci
+      - run: npm run build
+      - name: Compare the full and reduced suites on the same runner
+        env:
+          OMITTED_FILES: |
+            test/agent-image-manifest-parser.test.ts
+            test/markdown-address.test.ts
+        run: |
+          set -euo pipefail
+          results="$RUNNER_TEMP/daemon-macos-comparison"
+          mkdir -p "$results"
+          {
+            git rev-parse HEAD
+            sw_vers
+            uname -m
+            printf 'ImageOS=%s ImageVersion=%s\n' "${ImageOS:-unknown}" "${ImageVersion:-unknown}"
+            sysctl -n hw.ncpu
+            sysctl -n hw.memsize
+            node --version
+            npm --version
+            tmux -V
+          } | tee "$results/runner.txt"
+
+          excludes=()
+          while IFS= read -r file; do
+            [[ -n "$file" ]] || continue
+            [[ "$file" =~ ^test/[A-Za-z0-9.-]+\.test\.ts$ ]]
+            test -f "packages/daemon/$file"
+            excludes+=(--exclude "$file")
+          done <<< "$OMITTED_FILES"
+          test "${#excludes[@]}" -gt 0
+          printf '%s\n' "$OMITTED_FILES" > "$results/omitted-files.txt"
+
+          run_suite() (
+            set -euo pipefail
+            local label="$1"
+            shift
+            local suite_root
+            suite_root=$(mktemp -d "$RUNNER_TEMP/opr-test.XXXXXX")
+            suite_root=$(cd "$suite_root" && pwd -P)
+            mkdir -p "$suite_root/home" "$suite_root/bin"
+            /usr/bin/install -m 0755 /bin/ps "$suite_root/bin/ps"
+            env -i HOME="$suite_root/home" PATH="$PATH" TMPDIR="$suite_root" TMUX_TMPDIR="$suite_root" \
+              CI=true TERM=xterm-256color \
+              sandbox-exec -D IPC_ROOT="$suite_root" -p '(version 1)(allow default)(deny network-outbound)(allow network-outbound (remote ip "localhost:*"))(allow network-outbound (subpath (param "IPC_ROOT")))' \
+              /bin/bash -s -- "$results/$label.json" "$@" <<'SUITE'
+            set -euo pipefail
+            node scripts/ci-macos-process-probe.mjs
+            export PATH="$TMPDIR/bin:$PATH"
+            test "$(command -v ps)" = "$TMPDIR/bin/ps"
+            report="$1"
+            shift
+            start=$(date +%s)
+            status=0
+            npm run test -w packages/daemon -- \
+              --no-cache --reporter=default --reporter=./test/ci-worker-observer.ts \
+              --reporter=json --outputFile.json="$report" --includeTaskLocation "$@" || status=$?
+            printf '%s\n' "$(( $(date +%s) - start ))" > "${report%.json}.seconds"
+            exit "$status"
+          SUITE
+          )
+
+          set +e
+          run_suite full
+          full_status=$?
+          run_suite reduced "${excludes[@]}"
+          reduced_status=$?
+          set -e
+          for label in full reduced; do
+            if [[ -s "$results/$label.json" ]]; then
+              node scripts/ci-vitest-summary.mjs "$results/$label.json" > "$results/$label.md"
+            fi
+          done
+          printf 'full=%s\nreduced=%s\n' "$full_status" "$reduced_status" | tee "$results/exit-status.txt"
+          test "$full_status" -eq 0 && test "$reduced_status" -eq 0
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() }}
+        with:
+          name: daemon-macos-comparison
+          path: ${{ runner.temp }}/daemon-macos-comparison/
+          if-no-files-found: error
